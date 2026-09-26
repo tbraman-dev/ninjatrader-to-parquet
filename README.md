@@ -68,6 +68,7 @@ python export_ncd.py [options]
 | `--workers N` | all cores | Worker processes. Use fewer if NinjaTrader is running on the same PC. |
 | `--force` | off | Export every day again and ignore the manifest. |
 | `--raw` | off | Keep every bar and tick. Without it, rows outside the instrument's trading hours are dropped: the daily halt, weekends, holidays and early closes. NinjaTrader's own export does the same. Use a separate `--out`. |
+| `--roll volume\|calendar` | `volume` | How the continuous files pick the roll day. `volume`: the first day the next contract trades more. `calendar`: a fixed date rule. |
 | `--no-stitch` | off | Write the per-day files only. |
 | `--csv` | off | Also write each continuous file as `.csv.gz`. |
 
@@ -108,7 +109,7 @@ Columns:
 | `volume` | int64 | |
 | `contract` | string | Continuous files only: the contract each row came from, for example `ES 12-26`. |
 
-Continuous files are **not back-adjusted**. The `contract` column tells you where each roll is, so you can adjust in your own code. The roll day is approximate: 8 days before the third Friday of the expiry month. For metals (GC, SI, HG, PL, PA, MGC, SIL), the 26th of the month before expiry. Each contract fills the continuous file from the previous contract's roll day to its own roll day, cut at UTC midnight. The first contract has no start limit and the last has no end limit. The per-day files are always exact. Only the choice of which contract fills a continuous file near a roll is a rule of thumb.
+Continuous files are **not back-adjusted**. The `contract` column tells you where each roll is, so you can adjust in your own code. By default the roll follows volume. The continuous file moves to the next contract on the first day that contract trades more than the current one. Daily volume comes from the per-day `Last` files: tick `Last` for the tick file, else minute `Last`. Bid and Ask roll on the same day as Last. The roll never goes back to an older contract. If there is no volume to compare for two contracts, the calendar rule is used. `--roll calendar` always uses it: 8 days before the third Friday of the expiry month; for metals (GC, SI, HG, PL, PA, MGC, SIL), the 26th of the month before expiry. The cut is at 18:00 ET, the start of the roll day's session. It falls in the daily halt, so no row is lost or doubled. The first contract has no start limit and the last has no end limit. The per-day files are always exact.
 
 ## Where NinjaTrader keeps the data
 

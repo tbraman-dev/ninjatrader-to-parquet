@@ -8,6 +8,8 @@ Contracts:   the folders of <nt8-dir>/db/minute and db/tick named "<ROOT> MM-YY"
 Per day:     <out>/<kind>/<type>/<CONTRACT_>/<YYYYMMDD>.parquet   (utc_us int64, open/high/low/close float64, volume int64; zstd)
 Continuous:  <out>/continuous/<SYM>_1min_<type>.parquet, <SYM>_tick_<type>.parquet  (+ contract, dictionary string)
              --csv also writes the same rows as <SYM>_..._<type>.csv.gz (header line, prices written like NT8's export).
+Roll:        --roll volume (default) switches from one contract to the next on the first day the next one trades
+             more (daily Last volume of the per-day files); --roll calendar uses a fixed date rule. Cut at 18:00 ET.
 Incremental: manifest.json per contract dir keeps each source's size + mtime_ns; unchanged days are skipped.
 Session filter: rows outside the instrument's NT8 trading-hours template (daily halt, weekend, holidays, early closes)
              are dropped like NT8's own export does; --raw keeps them. After a template update or a --raw switch, run --force.
@@ -37,14 +39,13 @@ import pyarrow.parquet as pq
 
 import ncd
 
-EPOCH = dt.datetime(1970, 1, 1)
 FIELDS = ("utc_us", "open", "high", "low", "close", "volume")
 DAY_SCHEMA = pa.schema([("utc_us", pa.int64())] + [(k, pa.float64()) for k in FIELDS[1:5]] + [("volume", pa.int64())])
 CONT_SCHEMA = DAY_SCHEMA.append(pa.field("contract", pa.dictionary(pa.int32(), pa.string())))
 CSV_OPTS = pcsv.WriteOptions(include_header=False, quoting_style="none")
 CONTRACT = re.compile(r"(\S+) (\d\d)-(\d\d)")
-# ponytail: approximate roll rule, a day or two off NT8's own rollover dates. It only decides which contract
-# fills a continuous file near a roll; the per-day files are exact. Roots not listed use the default rule.
+# Calendar roll rule: --roll calendar, and the fallback when a pair of contracts has no volume to compare.
+# Roots not listed use the default rule.
 ROLL_26TH_OF_PRIOR_MONTH = {"GC", "SI", "HG", "PL", "PA", "MGC", "SIL"}  # metals; default: 8 days before 3rd Friday
 
 
@@ -70,8 +71,54 @@ def discover(db):
     return {r: sorted(c.items(), key=lambda x: x[1]) for r, c in sorted(found.items())}
 
 
+def pick_rolls(cons, vol, read=lambda v: v):
+    """Volume roll: [(contract, roll date)] like discover(), each date replaced by the first day the next contract's
+    volume beats this one's. vol: {contract: {date: volume, or what read() turns into it}}; read runs only on days
+    both contracts have. Never rolls back. A day this contract has no data but has data later is a gap, skipped;
+    after its last day it counts as 0. No data for either contract of a pair: keep the calendar date."""
+    out, start = [], None
+    for i, (a, cal) in enumerate(cons):
+        va, vb = vol.get(a, {}), vol.get(cons[i + 1][0], {}) if i + 1 < len(cons) else {}
+        end = None
+        if not va or not vb:
+            end = cal
+        else:
+            last_a = max(va)
+            for d in sorted(set(va) | set(vb)):
+                if (start and d < start) or d not in vb:
+                    continue
+                if (d in va and read(vb[d]) > read(va[d])) or (d not in va and d > last_a):
+                    end = d
+                    break
+            if end is None:  # the next contract never traded more: this one stays front past its data
+                end = max(max(va), max(vb)) + dt.timedelta(days=1)
+        start = max(end, start) if start and end else end
+        out.append((a, start))
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def day_volume(path):
+    return pc.sum(pq.ParquetFile(path).read(columns=["volume"])["volume"]).as_py() or 0
+
+
+def volume_days(out, kind, inst):
+    """{date: per-day Last parquet path} of one contract, or {} if it has none."""
+    d = os.path.join(out, kind, "Last", inst.replace(" ", "_"))
+    names = os.listdir(d) if os.path.isdir(d) else []
+    return {dt.date(int(f[:4]), int(f[4:6]), int(f[6:8])): os.path.join(d, f)
+            for f in names if re.fullmatch(r"\d{8}\.parquet", f)}
+
+
+def session_start_us(day):
+    """UTC microseconds of the session that trades on `day`: 18:00 ET the evening before."""
+    # ponytail: fixed 18:00 ET break, right for CME Globex (daily halt 17:00-18:00 ET); other exchanges need their own
+    t = dt.datetime.combine(day - dt.timedelta(days=1), dt.time(18), tzinfo=ncd.ET)
+    return int(t.timestamp()) * 1_000_000
+
+
 def windows(cons):
-    """[(contract, start, stop)]: each contract owns [previous roll, own roll) (UTC dates); None = open end."""
+    """[(contract, start, stop)]: each contract owns [previous roll, own roll) (session days); None = open end."""
     return [(inst, cons[i - 1][1] if i else None, roll if i + 1 < len(cons) else None) for i, (inst, roll) in enumerate(cons)]
 
 
@@ -171,13 +218,20 @@ def plan(db, out, kind, typ, inst, force, hours, tz):
     return tasks, man, mpath, skipped
 
 
-def stitch(out, cons, kinds, types, csv):
+def stitch(out, cons, kinds, types, csv, roll="volume"):
     """Continuous file per symbol: each contract's day files, cut to its window, streamed one day at a time.
-    cons: {symbol: [(contract, roll date)]} as discover() returns it."""
+    cons: {symbol: [(contract, roll date)]} as discover() returns it. roll="volume" picks the roll days from the
+    per-day Last volumes of this kind (a missing day: the other kind's), so Bid/Ask roll on the same day as Last."""
     os.makedirs(os.path.join(out, "continuous"), exist_ok=True)
-    for sym, sym_cons in cons.items():
+    for sym, cal_cons in cons.items():
         for kind in kinds:
             label = "1min" if kind == "minute" else "tick"
+            sym_cons = cal_cons
+            if roll == "volume":
+                other = "tick" if kind == "minute" else "minute"  # fills days this kind is missing
+                vol = {c: {**volume_days(out, other, c), **volume_days(out, kind, c)} for c, _ in cal_cons}
+                sym_cons = pick_rolls(cal_cons, vol, day_volume)
+            print(f"{sym} {kind} rolls: " + ", ".join(f"{c}->{d}" for (c, _), (_, d) in zip(cal_cons[1:], sym_cons)), flush=True)
             for t in types[kind]:
                 dst = os.path.join(out, "continuous", f"{sym}_{label}_{t}")
                 rows = unsorted = 0
@@ -186,12 +240,11 @@ def stitch(out, cons, kinds, types, csv):
                 if gz:
                     gz.write(b"utc_us,open,high,low,close,volume,contract\n")
                 for inst, start, stop in windows(sym_cons):
-                    # ponytail: window edges at UTC midnight, not at the session break
-                    lo = int((dt.datetime.combine(start, dt.time()) - EPOCH).total_seconds() * 1e6) if start else -2**63
-                    hi = int((dt.datetime.combine(stop, dt.time()) - EPOCH).total_seconds() * 1e6) if stop else 2**63 - 1
+                    lo = session_start_us(start) if start else -2**63  # cut in the daily halt: no row lost or doubled
+                    hi = session_start_us(stop) if stop else 2**63 - 1
                     d = os.path.join(out, kind, t, inst.replace(" ", "_"))
                     files = sorted(f for f in os.listdir(d) if f.endswith(".parquet")) if os.path.isdir(d) else []
-                    # a day file may hold the prior evening's session: read one day either side of the window
+                    # a day file may hold the next session's evening: read one day either side of the window
                     first = f"{start - dt.timedelta(days=1):%Y%m%d}" if start else ""
                     last = f"{stop + dt.timedelta(days=1):%Y%m%d}" if stop else "99999999"
                     prev = -1
@@ -238,6 +291,8 @@ def main():
     ap.add_argument("--workers", type=int, default=os.cpu_count())
     ap.add_argument("--no-stitch", action="store_true")
     ap.add_argument("--raw", action="store_true", help="keep rows outside the trading-hours template (NT8's export drops them); use a separate --out")
+    ap.add_argument("--roll", choices=("volume", "calendar"), default="volume",
+                    help="volume (default): roll on the first day the next contract trades more; calendar: fixed date rule")
     ap.add_argument("--csv", action="store_true", help="also write each continuous file as csv.gz (header line, prices written like NT8)")
     a = ap.parse_args()
     kinds = a.kinds.split(",")
@@ -304,7 +359,7 @@ def main():
                 save_json(mpath, man)
                 print(f"{label}: done", flush=True)
     if not a.no_stitch:
-        stitch(a.out, cons, kinds, types, a.csv)
+        stitch(a.out, cons, kinds, types, a.csv, a.roll)
     print(f"decoded {n['ok']} days, skipped {n['skipped']} unchanged, changed-during-read {n['changed']}, "
           f"failed {n['failed']} (see {errlog}), {n['rows']:,} rows, {time.time() - t0:.0f}s", flush=True)
     return 1 if n["failed"] else 0
