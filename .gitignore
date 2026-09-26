@@ -1,0 +1,4 @@
+__pycache__/
+export_solo/
+*.parquet
+*.csv.gz
